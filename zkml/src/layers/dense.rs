@@ -242,6 +242,52 @@ impl Dense {
         Ok(claim)
     }
 
+    pub fn prove_backward_step<'b, E, T>(
+        &self,
+        prover: &mut Prover<E, T>,
+        last_claim: Claim<E>,
+        output_grad: &Tensor<Element>,  // 改为 Element 类型
+        input: &Tensor<Element>,        // 改为 Element 类型
+        info: &DenseBackwardCtx<E>,
+    ) -> anyhow::Result<Claim<E>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        T: Transcript<E>,
+    {
+        // 1. 计算梯度
+        let matrix_t = self.matrix.transpose();
+        let input_grad = matrix_t.matvec(output_grad);
+        
+        // 2. 转换为MLE表示
+        let mut mat_t_mle = matrix_t.to_mle_2d();
+        mat_t_mle.fix_high_variables_in_place(&last_claim.point);
+        let grad_mle = output_grad.evals_flat::<E>().into_mle();  // 使用 evals_flat 转换
+
+        let num_vars = grad_mle.num_vars();
+        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        vp.add_mle_list(
+            vec![mat_t_mle.into(), grad_mle.into()],
+            E::ONE,
+        );
+
+        // 3. 生成sumcheck证明
+        let tmp_transcript = prover.transcript.clone();
+        let (proof, state) = IOPProverState::<E>::prove_parallel(vp, prover.transcript);
+
+        // 4. 添加证明到prover
+        prover.push_proof(LayerProof::DenseBackward(DenseBackwardProof {
+            sumcheck: proof.clone(),
+            individual_claims: state.get_mle_final_evaluations(),
+        }));
+
+        // 5. 返回声明
+        Ok(Claim {
+            point: proof.point,
+            eval: state.get_mle_final_evaluations()[1],
+        })
+    }
+
     pub(crate) fn step_info<E: ExtensionField>(
         &self,
         id: PolyID,
@@ -321,6 +367,27 @@ impl Dense {
         // 更新偏置
         let scaled_bias_grad = bias_grad.scale(learning_rate);
         self.bias = self.bias.sub(&scaled_bias_grad);
+    }
+}
+
+/// Information stored in the context (setup phase) for the backward step of this layer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DenseBackwardCtx<E> {
+    pub matrix_t_poly_id: PolyID,
+    pub matrix_t_poly_aux: VPAuxInfo<E>,
+}
+
+/// Proof of the backward step of the layer.
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct DenseBackwardProof<E: ExtensionField> {
+    pub sumcheck: IOPProof<E>,
+    pub individual_claims: Vec<E>,
+}
+
+impl<E: ExtensionField> DenseBackwardProof<E> {
+    /// 返回sumcheck最后的各个多项式在随机点的评估值的乘积
+    pub fn individual_to_virtual_claim(&self) -> E {
+        self.individual_claims.iter().fold(E::ONE, |acc, e| acc * e)
     }
 }
 

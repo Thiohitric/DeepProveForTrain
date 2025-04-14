@@ -6,17 +6,23 @@ use crate::{
     lookup::{
         context::TableType,
         logup_gkr::{
-            prover::batch_prove as logup_batch_prove, structs::LogUpProof,
+            prover::batch_prove as logup_batch_prove, 
+            structs::LogUpProof,
             verifier::verify_logup_proof,
         },
     },
 };
+use multilinear_extensions::virtual_poly::{VirtualPolynomial, VPAuxInfo};  // 添加 VPAuxInfo
+use multilinear_extensions::mle::{IntoMLE, MultilinearExtension, DenseMultilinearExtension}; // 修改导入，添加 MultilinearExtension trait
+use sumcheck::structs::{IOPProof, IOPProverState, IOPVerifierState};  // 添加 IOPVerifierState
+use sumcheck::prover::batch_prove;  // 添加这个导入
 use ff_ext::ExtensionField;
 use gkr::util::ceil_log2;
-use multilinear_extensions::mle::IntoMLE;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use transcript::Transcript;
+use anyhow::{ensure, Result};
+use std::sync::Arc;
 
 use crate::{
     Element,
@@ -35,6 +41,27 @@ pub struct ActivationCtx {
     pub op: Activation,
     pub poly_id: PolyID,
     pub num_vars: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActivationBackwardCtx<E> {
+    pub input_poly_id: PolyID,
+    pub matrix_poly_aux: VPAuxInfo<E>,  // 重命名为与Dense一致的风格
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct ActivationBackwardProof<E: ExtensionField> {
+    /// sumcheck证明，用于证明反向传播计算的正确性
+    pub(crate) sumcheck: IOPProof<E>,
+    /// 最终的个别多项式评估值
+    individual_claims: Vec<E>,
+}
+
+impl<E: ExtensionField> ActivationBackwardProof<E> {
+    /// 计算虚拟多项式的最终评估值
+    pub fn individual_to_virtual_claim(&self) -> E {
+        self.individual_claims.iter().fold(E::ONE, |acc, e| acc * e)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -231,6 +258,96 @@ impl Relu {
                 .collect()
         )
     }
+
+    pub fn prove_backward_step<'b, E, T>(
+        &self,
+        prover: &mut Prover<E, T>,
+        last_claim: Claim<E>,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>,
+        info: &ActivationBackwardCtx<E>,
+    ) -> Result<Claim<E>>
+    where
+        E: ExtensionField + Serialize + DeserializeOwned,
+        E::BaseField: Serialize + DeserializeOwned,
+        T: Transcript<E>,
+    {
+        // 计算输入梯度并转换为 Arc<dyn MultilinearExtension>
+        let input_mle = Arc::new(input.evals_flat::<E>().into_mle());
+        let grad_mle = Arc::new(output_grad.evals_flat::<E>().into_mle());
+        
+        // 构造虚拟多项式
+        let num_vars = input_mle.num_vars();
+        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        
+        // fix_variables 返回的也需要包装成 Arc
+        let fixed_input_mle = Arc::new(input_mle.fix_variables(&last_claim.point));
+        
+        vp.add_mle_list(
+            vec![fixed_input_mle, grad_mle],
+            E::ONE,
+        );
+
+        // 使用 batch_prove 而不是 prove_parallel
+        let (proof, individual_claims) = batch_prove(
+            vp,
+            prover.transcript,
+        )?;  // 注意这里需要用 ? 操作符处理错误
+
+        prover.push_proof(LayerProof::ActivationBackward(ActivationBackwardProof {
+            sumcheck: proof.clone(),
+            individual_claims,
+        }));
+
+        Ok(Claim {
+            point: proof.point,
+            eval: individual_claims[1],
+        })
+    }
+
+    pub fn verify_backward_step<E: ExtensionField, T: Transcript<E>>(
+        &self,
+        verifier: &mut Verifier<E, T>,
+        last_claim: Claim<E>,
+        output_grad: &Tensor<Element>,
+        input: &Tensor<Element>,
+        proof: &ActivationBackwardProof<E>,
+        info: &ActivationBackwardCtx<E>,
+    ) -> Result<Claim<E>>
+    where 
+        E::BaseField: Serialize + DeserializeOwned,
+        E: Serialize + DeserializeOwned,
+    {
+        // 重构虚拟多项式
+        let input_mle = input.evals_flat::<E>().into_mle();
+        let grad_mle = output_grad.evals_flat::<E>().into_mle();
+        
+        let num_vars = input_mle.num_vars();
+        let mut vp = VirtualPolynomial::<E>::new(num_vars);
+        vp.add_mle_list(
+            vec![input_mle.into(), grad_mle.into()],
+            E::ONE,
+        );
+
+        // 使用正确的verify函数和参数
+        let subclaim = IOPVerifierState::verify(
+            proof.individual_to_virtual_claim(), // claimed sum
+            &proof.sumcheck,                     // sumcheck proof
+            &info.matrix_poly_aux,              // aux info
+            verifier.transcript,                 // transcript
+        );
+
+        // 验证最终的评估值
+        ensure!(
+            proof.individual_to_virtual_claim() == subclaim.expected_evaluation,
+            "sumcheck claim failed"
+        );
+
+        Ok(Claim {
+            point: subclaim.point_flat(),
+            eval: proof.individual_claims[1],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +441,17 @@ mod test {
             input_grad2.get_data(),
             vec![0, 0, 2] // -1 -> 0, 0 -> 0, 1 -> 2(=2*1)
         );
+    }
+
+    #[test]
+    fn test_activation_backward_proof() {
+        // 创建测试数据
+        let relu = Relu::new();
+        let input = Tensor::new(vec![2], vec![1, -1]);  // 一个正数一个负数
+        let output_grad = Tensor::new(vec![2], vec![1, 1]);
+        
+        // 验证backward计算的正确性
+        let grad = relu.backward(&output_grad, &input);
+        assert_eq!(grad.get_data(), vec![1, 0]);  // 期望 [1, 0]，因为只有正数处导数为1
     }
 }

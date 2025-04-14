@@ -9,7 +9,7 @@ use crate::{
     commit::precommit::PolyID,
     iop::context::{ContextAux, TableCtx},
     layers::{
-        activation::{Activation, ActivationProof, Relu},
+        activation::Relu,  // 只保留 Relu
         convolution::Convolution,
         dense::Dense,
         pooling::Pooling,
@@ -17,9 +17,16 @@ use crate::{
     },
     tensor::{ConvData, Tensor},
 };
+
+pub use activation::{
+    Activation,
+    ActivationProof,
+    ActivationBackwardProof,
+};
+
 use activation::ActivationCtx;
 use convolution::{ConvCtx, ConvProof, SchoolBookConvCtx};
-use dense::{DenseCtx, DenseProof};
+use dense::{DenseCtx, DenseProof, DenseBackwardProof};
 use ff_ext::ExtensionField;
 use pooling::{PoolingCtx, PoolingProof};
 use requant::RequantCtx;
@@ -65,8 +72,10 @@ where
     E::BaseField: Serialize + DeserializeOwned,
 {
     Dense(DenseProof<E>),
+    DenseBackward(DenseBackwardProof<E>),
     Convolution(ConvProof<E>),
     Activation(ActivationProof<E>),
+    ActivationBackward(ActivationBackwardProof<E>),
     Requant(RequantProof<E>),
     Pooling(PoolingProof<E>),
 }
@@ -199,8 +208,10 @@ where
     pub fn variant_name(&self) -> String {
         match self {
             Self::Dense(_) => "Dense".to_string(),
+            Self::DenseBackward(_) => "DenseBackward".to_string(),
             Self::Convolution(_) => "Convolution".to_string(),
             Self::Activation(_) => "Activation".to_string(),
+            Self::ActivationBackward(_) => "ActivationBackward".to_string(),
             Self::Requant(_) => "Requant".to_string(),
             Self::Pooling(_) => "Pooling".to_string(),
         }
@@ -209,7 +220,9 @@ where
     pub fn get_lookup_data(&self) -> Option<(Vec<E>, Vec<E>)> {
         match self {
             LayerProof::Dense(..) => None,
+            LayerProof::DenseBackward(..) => None,
             LayerProof::Convolution(..) => None,
+            LayerProof::ActivationBackward(..) => None,
             LayerProof::Activation(ActivationProof { lookup, .. })
             | LayerProof::Requant(RequantProof { lookup, .. })
             | LayerProof::Pooling(PoolingProof { lookup, .. }) => Some(lookup.fractional_outputs()),
